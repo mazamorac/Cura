@@ -1,4 +1,4 @@
-# Copyright (c) 2018 Ultimaker B.V.
+# Copyright (c) 2020 Ultimaker B.V.
 # Cura is released under the terms of the LGPLv3 or higher.
 
 import sys
@@ -71,6 +71,8 @@ class SimulationView(CuraView):
         self._max_paths = 0
         self._current_path_num = 0
         self._minimum_path_num = 0
+        self.start_elements_index = 0
+        self.end_elements_index = 0
         self.currentLayerNumChanged.connect(self._onCurrentLayerNumChanged)
 
         self._busy = False
@@ -114,8 +116,9 @@ class SimulationView(CuraView):
         self._only_show_top_layers = bool(Application.getInstance().getPreferences().getValue("view/only_show_top_layers"))
         self._compatibility_mode = self._evaluateCompatibilityMode()
 
-        self._wireprint_warning_message = Message(catalog.i18nc("@info:status", "Cura does not accurately display layers when Wire Printing is enabled"),
+        self._wireprint_warning_message = Message(catalog.i18nc("@info:status", "Cura does not accurately display layers when Wire Printing is enabled."),
                                                   title = catalog.i18nc("@info:title", "Simulation View"))
+        self._slice_first_warning_message = Message(catalog.i18nc("@info:status", "Nothing is shown because you need to slice first."), title = catalog.i18nc("@info:title", "No layers to show"))
 
         QtApplication.getInstance().engineCreatedSignal.connect(self._onEngineCreated)
 
@@ -147,6 +150,7 @@ class SimulationView(CuraView):
         if self._activity == activity:
             return
         self._activity = activity
+        self._updateSliceWarningVisibility()
         self.activityChanged.emit()
 
     def getSimulationPass(self) -> SimulationPass:
@@ -243,6 +247,7 @@ class SimulationView(CuraView):
                 self._minimum_layer_num = self._current_layer_num
 
             self._startUpdateTopLayers()
+            self.recalculateStartEndElements()
 
             self.currentLayerNumChanged.emit()
 
@@ -257,7 +262,7 @@ class SimulationView(CuraView):
                 self._current_layer_num = self._minimum_layer_num
 
             self._startUpdateTopLayers()
-
+            self.recalculateStartEndElements()
             self.currentLayerNumChanged.emit()
 
     def setPath(self, value: int) -> None:
@@ -271,7 +276,7 @@ class SimulationView(CuraView):
                 self._minimum_path_num = self._current_path_num
 
             self._startUpdateTopLayers()
-
+            self.recalculateStartEndElements()
             self.currentPathNumChanged.emit()
 
     def setMinimumPath(self, value: int) -> None:
@@ -292,8 +297,9 @@ class SimulationView(CuraView):
     #
     #   \param layer_view_type integer as in SimulationView.qml and this class
     def setSimulationViewType(self, layer_view_type: int) -> None:
-        self._layer_view_type = layer_view_type
-        self.currentLayerNumChanged.emit()
+        if layer_view_type != self._layer_view_type:
+            self._layer_view_type = layer_view_type
+            self.currentLayerNumChanged.emit()
 
     ##  Return the layer view type, integer as in SimulationView.qml and this class
     def getSimulationViewType(self) -> int:
@@ -357,6 +363,24 @@ class SimulationView(CuraView):
         if abs(self._min_thickness - sys.float_info.max) < 10: # Some lenience due to floating point rounding.
             return 0.0 # If it's still max-float, there are no measurements. Use 0 then.
         return self._min_thickness
+
+    def recalculateStartEndElements(self):
+        self.start_elements_index = 0
+        self.end_elements_index = 0
+        scene = self.getController().getScene()
+        for node in DepthFirstIterator(scene.getRoot()):  # type: ignore
+            layer_data = node.callDecoration("getLayerData")
+            if not layer_data:
+                continue
+
+            # Found a the layer data!
+            element_counts = layer_data.getElementCounts()
+            for layer in sorted(element_counts.keys()):
+                if layer == self._current_layer_num:
+                    break
+                if self._minimum_layer_num > layer:
+                    self.start_elements_index += element_counts[layer]
+                self.end_elements_index += element_counts[layer]
 
     def getMaxThickness(self) -> float:
         return self._max_thickness
@@ -521,11 +545,13 @@ class SimulationView(CuraView):
             self._composite_pass.getLayerBindings().append("simulationview")
             self._old_composite_shader = self._composite_pass.getCompositeShader()
             self._composite_pass.setCompositeShader(self._simulationview_composite_shader)
+            self._updateSliceWarningVisibility()
 
         elif event.type == Event.ViewDeactivateEvent:
             self._controller.getScene().getRoot().childrenChanged.disconnect(self._onSceneChanged)
             Application.getInstance().getPreferences().preferenceChanged.disconnect(self._onPreferencesChanged)
             self._wireprint_warning_message.hide()
+            self._slice_first_warning_message.hide()
             Application.getInstance().globalContainerStackChanged.disconnect(self._onGlobalStackChanged)
             if self._global_container_stack:
                 self._global_container_stack.propertyChanged.disconnect(self._onPropertyChanged)
@@ -571,11 +597,13 @@ class SimulationView(CuraView):
 
     def _onCurrentLayerNumChanged(self) -> None:
         self.calculateMaxPathsOnLayer(self._current_layer_num)
+        scene = Application.getInstance().getController().getScene()
+        scene.sceneChanged.emit(scene.getRoot())
 
     def _startUpdateTopLayers(self) -> None:
         if not self._compatibility_mode:
             return
-
+        self.recalculateStartEndElements()
         if self._top_layers_job:
             self._top_layers_job.finished.disconnect(self._updateCurrentLayerMesh)
             self._top_layers_job.cancel()
@@ -636,6 +664,12 @@ class SimulationView(CuraView):
             return
 
         self._updateWithPreferences()
+
+    def _updateSliceWarningVisibility(self):
+        if not self.getActivity():
+            self._slice_first_warning_message.show()
+        else:
+            self._slice_first_warning_message.hide()
 
 
 class _CreateTopLayersJob(Job):
